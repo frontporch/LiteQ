@@ -29,19 +29,27 @@ namespace LiteQ
 			return new Sender<TRequest, TResponse>(queueName, localHandler);
 		}
 
-		public abstract class SenderBase
+		public class Sender<TRequest, TResponse>
 		{
-			protected readonly string _QueueName;
+			private readonly string _QueueName;
+			private readonly Func<TRequest, TResponse> _LocalHandler;
 
-			protected MessageQueue _ResponseQueue;
+			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
+				new Dictionary<string, TaskCompletionSource<TResponse>>();
+			
+			private readonly MessageQueue _ResponseQueue;
 
-			protected SenderBase(string queueName)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler)
 			{
 				_QueueName = queueName;
-				AddAdminQueue(queueName);
+				_LocalHandler = localHandler;
+
+				AddAdminQueue();
+				AddInboundQueue();
+				_ResponseQueue = SetupResponseQueue();
 			}
 
-			protected Task<TResponse> Send<TRequest, TResponse>(IPAddress peerIP, TRequest body, Dictionary<string, TaskCompletionSource<TResponse>> jobs)
+			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
 			{
 				//if done locally, just do it
 
@@ -65,7 +73,7 @@ namespace LiteQ
 						Formatter = new BinaryMessageFormatter()
 					};
 
-					jobs.Add(correlationId, taskCompletionSource);
+					_Jobs.Add(correlationId, taskCompletionSource);
 
 					using (var transaction = new MessageQueueTransaction())
 					{
@@ -82,7 +90,7 @@ namespace LiteQ
 				}
 			}
 
-			protected void AddOutboundQueue(IPAddress peerIP)
+			private void AddOutboundQueue(IPAddress peerIP)
 			{
 				int outboundKeyHash = (peerIP + _QueueName).GetHashCode();
 
@@ -106,28 +114,28 @@ namespace LiteQ
 				}
 			}
 			
-			protected void AddAdminQueue(string queueName)
+			private void AddAdminQueue()
 			{
-				string administrationQueuePath = String.Format(@".\Private$\Administration_{0}", queueName);
+				string administrationQueuePath = String.Format(@".\Private$\Administration_{0}", _QueueName);
 
 				if (!MessageQueue.Exists(administrationQueuePath))
 					MessageQueue.Create(administrationQueuePath);
 
-				_Administration.Add(queueName, new MessageQueue
+				_Administration.Add(_QueueName, new MessageQueue
 				{
 					Path = administrationQueuePath,
 					Formatter = new BinaryMessageFormatter()
 				});
 			}
 
-			protected void AddResponseQueue<T>(string queueName, Dictionary<string, TaskCompletionSource<T>> jobs)
+			private MessageQueue SetupResponseQueue()
 			{
-				string responsePath = String.Format(@".\Private$\Response_{0}", queueName);
+				string responsePath = String.Format(@".\Private$\Response_{0}", _QueueName);
 
 				if (!MessageQueue.Exists(responsePath))
 					MessageQueue.Create(responsePath, true);
 
-				_ResponseQueue = new MessageQueue
+				var q = new MessageQueue
 				{
 					Path = responsePath,
 					Formatter = new BinaryMessageFormatter(),
@@ -138,16 +146,18 @@ namespace LiteQ
 					},
 				};
 
-				_ResponseQueue.ReceiveCompleted += (s, args) => ResponseListener(s, args, jobs);
-				_ResponseQueue.BeginReceive(MessageQueue.InfiniteTimeout);
+				q.ReceiveCompleted += ResponseListener;
+				q.BeginReceive(MessageQueue.InfiniteTimeout);
+
+				return q;
 			}
 
-			protected void AddInboundQueue<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler)
+			private void AddInboundQueue()
 			{
-				if (_InBound.ContainsKey(queueName))
+				if (_InBound.ContainsKey(_QueueName))
 					throw new ArgumentException("Queue with that name already exits");
 
-				string queuePath = String.Format(@".\Private$\{0}", queueName);
+				string queuePath = String.Format(@".\Private$\{0}", _QueueName);
 
 				if (!MessageQueue.Exists(queuePath))
 					MessageQueue.Create(queuePath, true);
@@ -167,13 +177,13 @@ namespace LiteQ
 					},
 				};
 
-				inboundQ.ReceiveCompleted += (s, args) => ListenReceiver(s, args, localHandler);
+				inboundQ.ReceiveCompleted += ListenReceiver;
 				inboundQ.BeginReceive(MessageQueue.InfiniteTimeout);
 
-				_InBound.Add(queueName, inboundQ);
+				_InBound.Add(_QueueName, inboundQ);
 			}
 
-			protected void ListenReceiver<TRequest, TResponse>(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Func<TRequest, TResponse> localHandler )
+			private void ListenReceiver(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
 			{
 				Message message = null;
 
@@ -195,7 +205,7 @@ namespace LiteQ
 
 						Message returnMessage = new Message
 						{
-							Body = localHandler(item),
+							Body = _LocalHandler(item),
 							Formatter = new BinaryMessageFormatter(),
 							CorrelationId = message.CorrelationId
 						};
@@ -218,7 +228,7 @@ namespace LiteQ
 				}
 			}
 
-			protected void ResponseListener<T>(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Dictionary<string, TaskCompletionSource<T>> jobs)
+			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
 			{
 				MessageQueue mq = (MessageQueue)sender;
 
@@ -228,8 +238,8 @@ namespace LiteQ
 
 					if (message != null)
 					{
-						T item = (T)message.Body;
-						jobs[message.CorrelationId].SetResult(item);
+						TResponse item = (TResponse)message.Body;
+						_Jobs[message.CorrelationId].SetResult(item);
 						Console.WriteLine(item.GetType());
 					}
 				}
@@ -242,49 +252,17 @@ namespace LiteQ
 			}
 		}
 
-		public class Sender<T> : SenderBase
+		public class Sender<T> : Sender<T, T>
 		{
-			private readonly Dictionary<string, TaskCompletionSource<T>> _Jobs =
-				new Dictionary<string, TaskCompletionSource<T>>();
-
-			public Sender(string queueName, Func<T,T> localHandler ) : base(queueName)
+			public Sender(string queueName, Func<T, T> localHandler ) : base(queueName, localHandler)
 			{
-				AddInboundQueue(queueName, localHandler);
-				AddResponseQueue(_QueueName, _Jobs);
-			}
-
-			public Task<T> Send(IPAddress peerIP, T body)
-			{
-				return Send<T, T>(peerIP, body, _Jobs);
 			}
 		}
 
-		public class Sender<TRequest, TResponse> : SenderBase
-		{
-			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
-				new Dictionary<string, TaskCompletionSource<TResponse>>();
-			
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler ) : base(queueName)
-			{
-				AddInboundQueue(queueName, localHandler);
-				AddResponseQueue(_QueueName, _Jobs);
-			}
-
-			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
-			{
-				return Send<TRequest, TResponse>(peerIP, body, _Jobs);
-			}
-		}
 
 		static IPAddress GetLocalIP()
 		{
-			var networkInterface = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(ni =>
-			{
-				if (ni.Name == "COMM")
-					return true;
-
-				return false;
-			});
+			var networkInterface = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(ni => ni.Name == "COMM");
 
 			try
 			{
