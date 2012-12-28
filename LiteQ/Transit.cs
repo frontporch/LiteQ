@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Messaging;
 using System.Net;
@@ -8,6 +9,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 
 namespace LiteQ
 {
@@ -16,17 +18,18 @@ namespace LiteQ
 		private static readonly Dictionary<string, MessageQueue> _InBound = new Dictionary<string, MessageQueue>();
 		private static readonly Dictionary<int, SenderInfo> _Outbound = new Dictionary<int, SenderInfo>();
 		private static readonly Dictionary<string, MessageQueue> _Administration = new Dictionary<string, MessageQueue>();
+		private static JsonSerializer _JsonSerializer;
 
 		private static readonly IPAddress _LocalIP = GetLocalIP();
 		
-		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler)
+		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, JsonConverter[] converters)
 		{
-			return new Sender<T>(queueName, localHandler);
+			return new Sender<T>(queueName, localHandler, converters);
 		}
 
-		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler )
+		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters )
 		{
-			return new Sender<TRequest, TResponse>(queueName, localHandler);
+			return new Sender<TRequest, TResponse>(queueName, localHandler, converters);
 		}
 
 		public class Sender<TRequest, TResponse>
@@ -39,10 +42,11 @@ namespace LiteQ
 			
 			private readonly MessageQueue _ResponseQueue;
 
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
 			{
 				_QueueName = queueName;
 				_LocalHandler = localHandler;
+				_JsonSerializer = new JsonSerializer(converters);
 
 				AddAdminQueue();
 				AddInboundQueue();
@@ -65,13 +69,13 @@ namespace LiteQ
 
 					Message message = new Message
 					{
-						Body = body,
 						AdministrationQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseAdminPath },
 						CorrelationId = correlationId,
 						AcknowledgeType = AcknowledgeTypes.PositiveArrival | AcknowledgeTypes.PositiveReceive,
 						ResponseQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseQueuePath },
-						Formatter = new BinaryMessageFormatter()
 					};
+
+					_JsonSerializer.SerializeMessageBody(message.BodyStream, body, typeof (TRequest), true);
 
 					_Jobs.Add(correlationId, taskCompletionSource);
 
@@ -81,7 +85,7 @@ namespace LiteQ
 						_Outbound[outboundKeyHash].OutboundQueue.Send(message, transaction);
 						transaction.Commit();
 					}
-
+					
 					return taskCompletionSource.Task;
 				}
 				catch (Exception e)
@@ -106,7 +110,6 @@ namespace LiteQ
 						OutboundQueue = new MessageQueue
 						{
 							Path = outboundQueuePath,
-							Formatter = new BinaryMessageFormatter(),
 						}
 					};
 
@@ -124,7 +127,6 @@ namespace LiteQ
 				_Administration.Add(_QueueName, new MessageQueue
 				{
 					Path = administrationQueuePath,
-					Formatter = new BinaryMessageFormatter()
 				});
 			}
 
@@ -138,7 +140,6 @@ namespace LiteQ
 				var q = new MessageQueue
 				{
 					Path = responsePath,
-					Formatter = new BinaryMessageFormatter(),
 					MessageReadPropertyFilter = new MessagePropertyFilter
 					{
 						Body = true,
@@ -166,7 +167,6 @@ namespace LiteQ
 				var inboundQ = new MessageQueue
 				{
 					Path = queuePath,
-					Formatter = new BinaryMessageFormatter(),
 					MessageReadPropertyFilter = new MessagePropertyFilter
 					{
 						Body = true,
@@ -197,68 +197,55 @@ namespace LiteQ
 
 				mq.BeginReceive(MessageQueue.InfiniteTimeout);
 
-				try
+				if (message != null)
 				{
-					if (message != null)
-					{
-						TRequest item = (TRequest)message.Body;
+					TRequest item = (TRequest)_JsonSerializer.Deserialize(typeof(TRequest), message.BodyStream);
 
-						Message returnMessage = new Message
-						{
-							Body = _LocalHandler(item),
-							Formatter = new BinaryMessageFormatter(),
-							CorrelationId = message.CorrelationId
-						};
-
-						using (var transaction = new MessageQueueTransaction())
-						{
-							transaction.Begin();
-							message.ResponseQueue.Send(returnMessage, transaction);
-							transaction.Commit();
-						}
-					}
-					else
+					Message returnMessage = new Message
 					{
-						Console.WriteLine("Message was null");
+						CorrelationId = message.CorrelationId
+					};
+
+					TResponse body = _LocalHandler(item);
+
+					_JsonSerializer.SerializeMessageBody(returnMessage.BodyStream, body, typeof(TResponse), true);
+
+					using (var transaction = new MessageQueueTransaction())
+					{
+						transaction.Begin();
+						message.ResponseQueue.Send(returnMessage, transaction);
+						transaction.Commit();
 					}
 				}
-				catch (Exception e)
+				else
 				{
-					Console.WriteLine(e);
+					Console.WriteLine("Message was null");
 				}
+				
 			}
 
 			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
 			{
 				MessageQueue mq = (MessageQueue)sender;
 
-				try
-				{
-					Message message = mq.EndReceive(receiveCompletedEventArgs.AsyncResult);
+				Message message = mq.EndReceive(receiveCompletedEventArgs.AsyncResult);
 
-					if (message != null)
-					{
-						TResponse item = (TResponse)message.Body;
-						_Jobs[message.CorrelationId].SetResult(item);
-						Console.WriteLine(item.GetType());
-					}
-				}
-				catch (Exception ex)
+				if (message != null)
 				{
-					Console.WriteLine(ex);
+					TResponse item = (TResponse) _JsonSerializer.Deserialize(typeof (TResponse), message.BodyStream);
+					_Jobs[message.CorrelationId].SetResult(item);
 				}
-
+				
 				mq.BeginReceive(MessageQueue.InfiniteTimeout);
 			}
 		}
 
 		public class Sender<T> : Sender<T, T>
 		{
-			public Sender(string queueName, Func<T, T> localHandler ) : base(queueName, localHandler)
+			public Sender(string queueName, Func<T, T> localHandler, JsonConverter[] converters ) : base(queueName, localHandler, converters )
 			{
 			}
 		}
-
 
 		static IPAddress GetLocalIP()
 		{
