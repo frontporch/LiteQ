@@ -32,35 +32,6 @@ namespace LiteQ
 			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, converters);
 		}
 
-		public class ShippingStore<TRequest, TResponse>
-		{
-			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
-				new Dictionary<string, TaskCompletionSource<TResponse>>();
-
-			private readonly Sender<TRequest, TResponse> _Sender; 
-
-			public ShippingStore(string uniqueId, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
-			{
-				_Sender = new Sender<TRequest, TResponse>(uniqueId, localHandler, Finalize, converters);
-			}
-
-			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
-			{
-				TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
-
-				string correlationId = _Sender.Send(peerIP, body);
-
-				_Jobs.Add(correlationId, taskCompletionSource);
-
-				return taskCompletionSource.Task;
-			}
-
-			public void Finalize(string correlationId, TResponse item)
-			{
-				_Jobs[correlationId].SetResult(item);
-			}
-		}
-
 		public class Sender<TRequest, TResponse>
 		{
 			private readonly string _QueueName;
@@ -297,6 +268,43 @@ namespace LiteQ
 				
 			}
 			return null;
+		}
+	}
+
+	public class ShippingStore<T> : ShippingStore<T, T>
+	{
+		public ShippingStore(string uniqueStoreName, Func<T, T> localHandler, JsonConverter[] converters)
+			: base(uniqueStoreName, localHandler, converters)
+		{	
+		}
+	}
+
+	public class ShippingStore<TRequest, TResponse>
+	{
+		private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
+			new Dictionary<string, TaskCompletionSource<TResponse>>();
+
+		private readonly Transit.Sender<TRequest, TResponse> _Sender;
+
+		public ShippingStore(string uniqueStoreName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
+		{
+			_Sender = new Transit.Sender<TRequest, TResponse>(uniqueStoreName, localHandler, Finalize, converters);
+		}
+
+		public Task<TResponse> Send(IPAddress peerIP, TRequest body)
+		{
+			TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
+
+			string correlationId = _Sender.Send(peerIP, body);
+
+			_Jobs.Add(correlationId, taskCompletionSource);
+
+			return taskCompletionSource.Task;
+		}
+
+		public void Finalize(string correlationId, TResponse item)
+		{
+			_Jobs[correlationId].SetResult(item);
 		}
 	}
 
