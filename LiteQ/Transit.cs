@@ -22,27 +22,54 @@ namespace LiteQ
 
 		private static readonly IPAddress _LocalIP = GetLocalIP();
 		
-		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, JsonConverter[] converters)
+		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<string, T> responseHandler, JsonConverter[] converters)
 		{
-			return new Sender<T>(queueName, localHandler, converters);
+			return new Sender<T>(queueName, localHandler, responseHandler, converters);
 		}
 
-		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters )
+		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<string, TResponse> responseHandler, JsonConverter[] converters )
 		{
-			return new Sender<TRequest, TResponse>(queueName, localHandler, converters);
+			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, converters);
+		}
+
+		public class ShippingStore<TRequest, TResponse>
+		{
+			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
+				new Dictionary<string, TaskCompletionSource<TResponse>>();
+
+			private readonly Sender<TRequest, TResponse> _Sender; 
+
+			public ShippingStore(string uniqueId, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
+			{
+				_Sender = new Sender<TRequest, TResponse>(uniqueId, localHandler, Finalize, converters);
+			}
+
+			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
+			{
+				TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
+
+				string correlationId = _Sender.Send(peerIP, body);
+
+				_Jobs.Add(correlationId, taskCompletionSource);
+
+				return taskCompletionSource.Task;
+			}
+
+			public void Finalize(string correlationId, TResponse item)
+			{
+				_Jobs[correlationId].SetResult(item);
+			}
 		}
 
 		public class Sender<TRequest, TResponse>
 		{
 			private readonly string _QueueName;
 			private readonly Func<TRequest, TResponse> _LocalHandler;
-
-			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
-				new Dictionary<string, TaskCompletionSource<TResponse>>();
+			private readonly Action<string, TResponse> _ResponseHandler; 
 			
 			private readonly MessageQueue _ResponseQueue;
 
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<string, TResponse> responseHandler, JsonConverter[] converters)
 			{
 				_QueueName = queueName;
 				_LocalHandler = localHandler;
@@ -51,14 +78,11 @@ namespace LiteQ
 				AddAdminQueue();
 				AddInboundQueue();
 				_ResponseQueue = SetupResponseQueue();
+				_ResponseHandler = responseHandler;
 			}
 
-			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
+			public string Send(IPAddress peerIP, TRequest body)
 			{
-				//if done locally, just do it
-
-				TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
-
 				try
 				{
 					int outboundKeyHash = (peerIP + _QueueName).GetHashCode();
@@ -77,16 +101,14 @@ namespace LiteQ
 
 					_JsonSerializer.SerializeMessageBody(message.BodyStream, body, typeof (TRequest), true);
 
-					_Jobs.Add(correlationId, taskCompletionSource);
-
 					using (var transaction = new MessageQueueTransaction())
 					{
 						transaction.Begin();
 						_Outbound[outboundKeyHash].OutboundQueue.Send(message, transaction);
 						transaction.Commit();
 					}
-					
-					return taskCompletionSource.Task;
+
+					return correlationId;
 				}
 				catch (Exception e)
 				{
@@ -147,7 +169,7 @@ namespace LiteQ
 					},
 				};
 
-				q.ReceiveCompleted += ResponseListener;
+				q.ReceiveCompleted += (sender, args) => ResponseListener(sender, args, _ResponseHandler);
 				q.BeginReceive(MessageQueue.InfiniteTimeout);
 
 				return q;
@@ -224,7 +246,7 @@ namespace LiteQ
 				
 			}
 
-			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
+			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Action<string, TResponse> responseHandler)
 			{
 				MessageQueue mq = (MessageQueue)sender;
 
@@ -233,7 +255,7 @@ namespace LiteQ
 				if (message != null)
 				{
 					TResponse item = (TResponse) _JsonSerializer.Deserialize(typeof (TResponse), message.BodyStream);
-					_Jobs[message.CorrelationId].SetResult(item);
+					responseHandler(message.CorrelationId, item);
 				}
 				
 				mq.BeginReceive(MessageQueue.InfiniteTimeout);
@@ -242,7 +264,7 @@ namespace LiteQ
 
 		public class Sender<T> : Sender<T, T>
 		{
-			public Sender(string queueName, Func<T, T> localHandler, JsonConverter[] converters ) : base(queueName, localHandler, converters )
+			public Sender(string queueName, Func<T, T> localHandler, Action<string, T> responseHandler, JsonConverter[] converters ) : base(queueName, localHandler, responseHandler, converters )
 			{
 			}
 		}
