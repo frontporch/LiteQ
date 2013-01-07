@@ -29,10 +29,13 @@ namespace LiteQ
 			_Serializer.NullValueHandling = NullValueHandling.Include;
 			_Deserializer.NullValueHandling = NullValueHandling.Include;
 
-			foreach (var converter in _Converters)
+			if (_Converters != null)
 			{
-				_Serializer.Converters.Add(converter);
-				_Deserializer.Converters.Add(converter);
+				foreach (var converter in _Converters)
+				{
+					_Serializer.Converters.Add(converter);
+					_Deserializer.Converters.Add(converter);
+				}
 			}
 
 			// Only give out strict ISO-8601
@@ -97,40 +100,6 @@ namespace LiteQ
 				throw new SerializationException("Deserialization failed", jsonException);
 			}
 		}
-
-		//public object DeserializeMessageBody(Type type, Stream source)
-		//{
-		//	try
-		//	{
-		//		var sr = new StreamReader(source);
-		//		var jr = new JsonTextReader(sr);
-		//		return _Deserializer.Deserialize(jr, type);
-		//	}
-		//	catch (JsonSerializationException jsonException)
-		//	{
-		//		throw new SerializationException("Deserialization failed", jsonException);
-		//	}
-		//	catch (JsonReaderException jsonException)
-		//	{
-		//		throw new SerializationException("Deserialization failed", jsonException);
-		//	}
-		//	catch (ArgumentException jsonException)
-		//	{
-		//		// It feels like a bug in Newtonsoft that its enum converter just throws ArgumentException rather than
-		//		// a Json*Exception
-		//		throw new SerializationException("Deserialization failed", jsonException);
-		//	}
-		//	catch (FormatException jsonException)
-		//	{
-		//		throw new SerializationException("Deserialization failed", jsonException);
-		//	}
-		//	catch (OverflowException jsonException)
-		//	{
-		//		throw new SerializationException("Deserialization failed", jsonException);
-		//	}
-		//}
-
-		// convenience methods
 
 		public static string SerializeToString(object item)
 		{

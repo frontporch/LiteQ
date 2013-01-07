@@ -22,37 +22,43 @@ namespace LiteQ
 
 		private static readonly IPAddress _LocalIP = GetLocalIP();
 		
-		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters)
+		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters = null, bool adminResponse = false)
 		{
 			return new Sender<T>(queueName, localHandler, responseHandler, converters);
 		}
 
-		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters )
+		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters, bool adminResponse = false )
 		{
-			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, converters);
+			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, converters, adminResponse);
 		}
 
 		public class Sender<TRequest, TResponse>
 		{
+			private const int TIME_TO_LIVE = 5;
+			
 			private readonly string _QueueName;
 			private readonly Func<TRequest, TResponse> _LocalHandler;
-			private readonly Action<Message, TResponse> _ResponseHandler; 
-			
-			private readonly MessageQueue _ResponseQueue;
+			private readonly Action<Message, TResponse> _ResponseHandler;
+			private readonly bool _AdminResponse;
+			public TimeSpan Timeout { get; set; }
 
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters, bool adminResponse)
 			{
 				_QueueName = queueName;
+				Timeout = TimeSpan.FromSeconds(TIME_TO_LIVE);
 				_LocalHandler = localHandler;
+				_AdminResponse = adminResponse;
 				_JsonSerializer = new JsonSerializer(converters);
 
-				AddAdminQueue();
+				if(_AdminResponse)
+					AddAdminQueue();
+
 				AddInboundQueue();
-				_ResponseQueue = SetupResponseQueue();
+				SetupResponseQueue();
 				_ResponseHandler = responseHandler;
 			}
 
-			public string Send(IPAddress peerIP, TRequest body)
+			public string Send(IPAddress peerIP, TRequest body, TimeSpan? timeout = null, MessagePriority priority = MessagePriority.Normal)
 			{
 				try
 				{
@@ -62,11 +68,16 @@ namespace LiteQ
 
 					string correlationId = Guid.NewGuid() + @"\" + "1";
 
+					if (timeout.HasValue)
+						Timeout = timeout.Value;
+
 					Message message = new Message
 					{
-						AdministrationQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseAdminPath },
+						AdministrationQueue = _AdminResponse ? new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseAdminPath } : null,
 						CorrelationId = correlationId,
-						AcknowledgeType = AcknowledgeTypes.PositiveArrival | AcknowledgeTypes.PositiveReceive,
+						AcknowledgeType = _AdminResponse ? AcknowledgeTypes.PositiveArrival | AcknowledgeTypes.PositiveReceive : AcknowledgeTypes.None,
+						TimeToBeReceived = Timeout,
+						Priority = priority,
 						ResponseQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseQueuePath },
 					};
 
@@ -123,7 +134,7 @@ namespace LiteQ
 				});
 			}
 
-			private MessageQueue SetupResponseQueue()
+			private void SetupResponseQueue()
 			{
 				string responsePath = String.Format(@".\Private$\Response_{0}", _QueueName);
 
@@ -142,8 +153,6 @@ namespace LiteQ
 
 				q.ReceiveCompleted += (sender, args) => ResponseListener(sender, args, _ResponseHandler);
 				q.BeginReceive(MessageQueue.InfiniteTimeout);
-
-				return q;
 			}
 
 			private void AddInboundQueue()
@@ -235,7 +244,7 @@ namespace LiteQ
 
 		public class Sender<T> : Sender<T, T>
 		{
-			public Sender(string queueName, Func<T, T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters ) : base(queueName, localHandler, responseHandler, converters )
+			public Sender(string queueName, Func<T, T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters = null, bool adminResponse = false ) : base(queueName, localHandler, responseHandler, converters, adminResponse )
 			{
 			}
 		}
@@ -273,8 +282,8 @@ namespace LiteQ
 
 	public class ShippingStore<T> : ShippingStore<T, T>
 	{
-		public ShippingStore(string uniqueStoreName, Func<T, T> localHandler, JsonConverter[] converters)
-			: base(uniqueStoreName, localHandler, converters)
+		public ShippingStore(string uniqueStoreName, Func<T, T> localHandler, JsonConverter[] converters = null, bool adminResponse = false)
+			: base(uniqueStoreName, localHandler, converters, adminResponse)
 		{	
 		}
 	}
@@ -286,16 +295,16 @@ namespace LiteQ
 
 		private readonly Transit.Sender<TRequest, TResponse> _Sender;
 
-		public ShippingStore(string uniqueStoreName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters)
+		public ShippingStore(string uniqueStoreName, Func<TRequest, TResponse> localHandler, JsonConverter[] converters = null, bool adminResponse = false)
 		{
-			_Sender = new Transit.Sender<TRequest, TResponse>(uniqueStoreName, localHandler, Finalize, converters);
+			_Sender = new Transit.Sender<TRequest, TResponse>(uniqueStoreName, localHandler, Finalize, converters, adminResponse);
 		}
 
-		public Task<TResponse> Send(IPAddress peerIP, TRequest body)
+		public Task<TResponse> Send(IPAddress peerIP, TRequest body, TimeSpan? timeout = null, MessagePriority priority = MessagePriority.Normal)
 		{
 			TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
 
-			string correlationId = _Sender.Send(peerIP, body);
+			string correlationId = _Sender.Send(peerIP, body, timeout, priority);
 
 			_Jobs.Add(correlationId, taskCompletionSource);
 
