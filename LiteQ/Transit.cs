@@ -22,12 +22,12 @@ namespace LiteQ
 
 		private static readonly IPAddress _LocalIP = GetLocalIP();
 		
-		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<string, T> responseHandler, JsonConverter[] converters)
+		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters)
 		{
 			return new Sender<T>(queueName, localHandler, responseHandler, converters);
 		}
 
-		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<string, TResponse> responseHandler, JsonConverter[] converters )
+		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters )
 		{
 			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, converters);
 		}
@@ -36,11 +36,11 @@ namespace LiteQ
 		{
 			private readonly string _QueueName;
 			private readonly Func<TRequest, TResponse> _LocalHandler;
-			private readonly Action<string, TResponse> _ResponseHandler; 
+			private readonly Action<Message, TResponse> _ResponseHandler; 
 			
 			private readonly MessageQueue _ResponseQueue;
 
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<string, TResponse> responseHandler, JsonConverter[] converters)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, JsonConverter[] converters)
 			{
 				_QueueName = queueName;
 				_LocalHandler = localHandler;
@@ -217,7 +217,7 @@ namespace LiteQ
 				
 			}
 
-			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Action<string, TResponse> responseHandler)
+			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Action<Message, TResponse> responseHandler)
 			{
 				MessageQueue mq = (MessageQueue)sender;
 
@@ -226,7 +226,7 @@ namespace LiteQ
 				if (message != null)
 				{
 					TResponse item = (TResponse) _JsonSerializer.Deserialize(typeof (TResponse), message.BodyStream);
-					responseHandler(message.CorrelationId, item);
+					responseHandler(message, item);
 				}
 				
 				mq.BeginReceive(MessageQueue.InfiniteTimeout);
@@ -235,7 +235,7 @@ namespace LiteQ
 
 		public class Sender<T> : Sender<T, T>
 		{
-			public Sender(string queueName, Func<T, T> localHandler, Action<string, T> responseHandler, JsonConverter[] converters ) : base(queueName, localHandler, responseHandler, converters )
+			public Sender(string queueName, Func<T, T> localHandler, Action<Message, T> responseHandler, JsonConverter[] converters ) : base(queueName, localHandler, responseHandler, converters )
 			{
 			}
 		}
@@ -302,9 +302,9 @@ namespace LiteQ
 			return taskCompletionSource.Task;
 		}
 
-		public void Finalize(string correlationId, TResponse item)
+		public void Finalize(Message message, TResponse item)
 		{
-			_Jobs[correlationId].SetResult(item);
+			_Jobs[message.CorrelationId].SetResult(item);
 		}
 	}
 
