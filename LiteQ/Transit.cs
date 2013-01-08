@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Messaging;
 using System.Net;
@@ -8,6 +9,7 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Newtonsoft.Json;
 
 namespace LiteQ
 {
@@ -16,64 +18,77 @@ namespace LiteQ
 		private static readonly Dictionary<string, MessageQueue> _InBound = new Dictionary<string, MessageQueue>();
 		private static readonly Dictionary<int, SenderInfo> _Outbound = new Dictionary<int, SenderInfo>();
 		private static readonly Dictionary<string, MessageQueue> _Administration = new Dictionary<string, MessageQueue>();
+		private static JsonSerializer _JsonSerializer;
 
 		private static readonly IPAddress _LocalIP = GetLocalIP();
 		
-		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler)
+		public static Sender<T> Register<T>(string queueName, Func<T,T> localHandler, Action<Message, T> responseHandler, Action<Exception> errorHandler, JsonConverter[] converters = null, bool adminResponse = false)
 		{
-			return new Sender<T>(queueName, localHandler);
+			return new Sender<T>(queueName, localHandler, responseHandler, errorHandler, converters);
 		}
 
-		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler )
+		public static Sender<TRequest, TResponse> Regsiter<TRequest, TResponse>(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, Action<Exception> errorHandler, JsonConverter[] converters, bool adminResponse = false )
 		{
-			return new Sender<TRequest, TResponse>(queueName, localHandler);
+			return new Sender<TRequest, TResponse>(queueName, localHandler, responseHandler, errorHandler, converters, adminResponse);
 		}
 
 		public class Sender<TRequest, TResponse>
 		{
+			private const int TIME_TO_LIVE = 10;
+			
 			private readonly string _QueueName;
 			private readonly Func<TRequest, TResponse> _LocalHandler;
+			private readonly Action<Message, TResponse> _ResponseHandler;
+			private readonly Action<Exception> _ErrorHandler;
+			private readonly bool _AdminResponse;
+			public TimeSpan Timeout { get; set; }
 
-			private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
-				new Dictionary<string, TaskCompletionSource<TResponse>>();
-			
-			private readonly MessageQueue _ResponseQueue;
-
-			public Sender(string queueName, Func<TRequest, TResponse> localHandler)
+			public Sender(string queueName, Func<TRequest, TResponse> localHandler, Action<Message, TResponse> responseHandler, Action<Exception> errorHandler, JsonConverter[] converters, bool adminResponse)
 			{
 				_QueueName = queueName;
+				Timeout = TimeSpan.FromSeconds(TIME_TO_LIVE);
 				_LocalHandler = localHandler;
+				_ErrorHandler = errorHandler;
+				_AdminResponse = adminResponse;
+				_JsonSerializer = new JsonSerializer(converters);
 
-				AddAdminQueue();
+				if(_AdminResponse)
+					AddAdminQueue();
+
 				AddInboundQueue();
-				_ResponseQueue = SetupResponseQueue();
+				SetupResponseQueue();
+				_ResponseHandler = responseHandler;
 			}
 
-			public Task<TResponse> Send(IPAddress peerIP, TRequest body)
+			public string Send(IPAddress peerIP, TRequest body, TimeSpan? timeout = null, MessagePriority priority = MessagePriority.Normal)
 			{
-				//if done locally, just do it
-
-				TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
-
 				try
 				{
 					int outboundKeyHash = (peerIP + _QueueName).GetHashCode();
 
-					AddOutboundQueue(peerIP);
+					if (!_Outbound.ContainsKey(outboundKeyHash))
+					{
+						AddOutboundQueue(peerIP, outboundKeyHash);
+					}
 
 					string correlationId = Guid.NewGuid() + @"\" + "1";
 
+					if (timeout.HasValue)
+						Timeout = timeout.Value;
+
 					Message message = new Message
 					{
-						Body = body,
-						AdministrationQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseAdminPath },
+						AdministrationQueue =
+							_AdminResponse ? new MessageQueue {Path = _Outbound[outboundKeyHash].ResponseAdminPath} : null,
 						CorrelationId = correlationId,
-						AcknowledgeType = AcknowledgeTypes.PositiveArrival | AcknowledgeTypes.PositiveReceive,
-						ResponseQueue = new MessageQueue { Path = _Outbound[outboundKeyHash].ResponseQueuePath },
-						Formatter = new BinaryMessageFormatter()
+						AcknowledgeType =
+							_AdminResponse ? AcknowledgeTypes.PositiveArrival | AcknowledgeTypes.PositiveReceive : AcknowledgeTypes.None,
+						TimeToBeReceived = Timeout,
+						Priority = priority,
+						ResponseQueue = new MessageQueue {Path = _Outbound[outboundKeyHash].ResponseQueuePath},
 					};
 
-					_Jobs.Add(correlationId, taskCompletionSource);
+					_JsonSerializer.SerializeMessageBody(message.BodyStream, body, typeof (TRequest), true);
 
 					using (var transaction = new MessageQueueTransaction())
 					{
@@ -82,74 +97,80 @@ namespace LiteQ
 						transaction.Commit();
 					}
 
-					return taskCompletionSource.Task;
+					return correlationId;
 				}
 				catch (Exception e)
 				{
-					return null;
+					_ErrorHandler(e);
+					return String.Empty;
 				}
 			}
 
-			private void AddOutboundQueue(IPAddress peerIP)
+			private void AddOutboundQueue(IPAddress peerIP, int keyHash)
 			{
-				int outboundKeyHash = (peerIP + _QueueName).GetHashCode();
+				string outboundQueuePath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\{1}", peerIP, _QueueName);
 
-				if (!_Outbound.ContainsKey(outboundKeyHash))
+				SenderInfo outboundInfo = new SenderInfo
 				{
-					string outboundQueuePath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\{1}", peerIP, _QueueName);
-
-					SenderInfo outboundInfo = new SenderInfo
+					OutboundQueuePath = outboundQueuePath,
+					ResponseQueuePath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\Response_{1}", _LocalIP, _QueueName),
+					ResponseAdminPath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\Administration_{1}", _LocalIP, _QueueName),
+					OutboundQueue = new MessageQueue
 					{
-						OutboundQueuePath = outboundQueuePath,
-						ResponseQueuePath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\Response_{1}", _LocalIP, _QueueName),
-						ResponseAdminPath = String.Format(@"FormatName:Direct=TCP:{0}\Private$\Administration_{1}", _LocalIP, _QueueName),
-						OutboundQueue = new MessageQueue
-						{
-							Path = outboundQueuePath,
-							Formatter = new BinaryMessageFormatter(),
-						}
-					};
+						Path = outboundQueuePath,
+					}
+				};
 
-					_Outbound.Add(outboundKeyHash, outboundInfo);
-				}
+				_Outbound.Add(keyHash, outboundInfo);
 			}
 			
 			private void AddAdminQueue()
 			{
 				string administrationQueuePath = String.Format(@".\Private$\Administration_{0}", _QueueName);
 
-				if (!MessageQueue.Exists(administrationQueuePath))
-					MessageQueue.Create(administrationQueuePath);
-
-				_Administration.Add(_QueueName, new MessageQueue
+				try
 				{
-					Path = administrationQueuePath,
-					Formatter = new BinaryMessageFormatter()
-				});
+
+					if (!MessageQueue.Exists(administrationQueuePath))
+						MessageQueue.Create(administrationQueuePath);
+
+					_Administration.Add(_QueueName, new MessageQueue
+					{
+						Path = administrationQueuePath,
+					});
+				}
+				catch (Exception e)
+				{
+					_ErrorHandler(e);
+				}
 			}
 
-			private MessageQueue SetupResponseQueue()
+			private void SetupResponseQueue()
 			{
 				string responsePath = String.Format(@".\Private$\Response_{0}", _QueueName);
 
-				if (!MessageQueue.Exists(responsePath))
-					MessageQueue.Create(responsePath, true);
-
-				var q = new MessageQueue
+				try
 				{
-					Path = responsePath,
-					Formatter = new BinaryMessageFormatter(),
-					MessageReadPropertyFilter = new MessagePropertyFilter
+					if (!MessageQueue.Exists(responsePath))
+						MessageQueue.Create(responsePath, true);
+
+					var q = new MessageQueue
 					{
-						Body = true,
-						CorrelationId = true,
-					},
-				};
+						Path = responsePath,
+						MessageReadPropertyFilter = new MessagePropertyFilter
+						{
+							Body = true,
+							CorrelationId = true
+						},
+					};
 
-				q.ReceiveCompleted += ResponseListener;
-				q.BeginReceive(MessageQueue.InfiniteTimeout);
-
-				return q;
+					q.ReceiveCompleted += (sender, args) => ResponseListener(sender, args, _ResponseHandler);
+					q.BeginReceive(MessageQueue.InfiniteTimeout);
+				}
+				catch (Exception e)
+				{
+					_ErrorHandler(e);
+				}
 			}
 
 			private void AddInboundQueue()
@@ -159,76 +180,72 @@ namespace LiteQ
 
 				string queuePath = String.Format(@".\Private$\{0}", _QueueName);
 
-				if (!MessageQueue.Exists(queuePath))
-					MessageQueue.Create(queuePath, true);
-
-
-				var inboundQ = new MessageQueue
+				try
 				{
-					Path = queuePath,
-					Formatter = new BinaryMessageFormatter(),
-					MessageReadPropertyFilter = new MessagePropertyFilter
+					if (!MessageQueue.Exists(queuePath))
+						MessageQueue.Create(queuePath, true);
+
+
+					var inboundQ = new MessageQueue
 					{
-						Body = true,
-						CorrelationId = true,
-						ResponseQueue = true,
-						AdministrationQueue = true,
-						AcknowledgeType = true
-					},
-				};
+						Path = queuePath,
+						MessageReadPropertyFilter = new MessagePropertyFilter
+						{
+							Body = true,
+							CorrelationId = true,
+							ResponseQueue = true,
+							AdministrationQueue = true,
+							AcknowledgeType = true
+						},
+					};
 
-				inboundQ.ReceiveCompleted += ListenReceiver;
-				inboundQ.BeginReceive(MessageQueue.InfiniteTimeout);
+					inboundQ.ReceiveCompleted += ListenReceiver;
+					inboundQ.BeginReceive(MessageQueue.InfiniteTimeout);
 
-				_InBound.Add(_QueueName, inboundQ);
+					_InBound.Add(_QueueName, inboundQ);
+				}
+				catch (Exception e)
+				{
+					_ErrorHandler(e);
+				}
 			}
 
 			private void ListenReceiver(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
 			{
-				Message message = null;
-
 				MessageQueue mq = (MessageQueue)sender;
 
 				try
 				{
-					message = mq.EndReceive(receiveCompletedEventArgs.AsyncResult);
-				}
-				catch (MessageQueueException ex) { }
+					Message message = mq.EndReceive(receiveCompletedEventArgs.AsyncResult);
+				
+					mq.BeginReceive(MessageQueue.InfiniteTimeout);
 
-				mq.BeginReceive(MessageQueue.InfiniteTimeout);
+					TRequest item = (TRequest) _JsonSerializer.Deserialize(typeof (TRequest), message.BodyStream);
 
-				try
-				{
-					if (message != null)
+					Message returnMessage = new Message
 					{
-						TRequest item = (TRequest)message.Body;
+						CorrelationId = message.CorrelationId
+					};
 
-						Message returnMessage = new Message
-						{
-							Body = _LocalHandler(item),
-							Formatter = new BinaryMessageFormatter(),
-							CorrelationId = message.CorrelationId
-						};
+					TResponse body = _LocalHandler(item);
 
-						using (var transaction = new MessageQueueTransaction())
-						{
-							transaction.Begin();
-							message.ResponseQueue.Send(returnMessage, transaction);
-							transaction.Commit();
-						}
-					}
-					else
+
+					_JsonSerializer.SerializeMessageBody(returnMessage.BodyStream, body, typeof (TResponse), true);
+
+					using (var transaction = new MessageQueueTransaction())
 					{
-						Console.WriteLine("Message was null");
+						transaction.Begin();
+						message.ResponseQueue.Send(returnMessage, transaction);
+						transaction.Commit();
 					}
 				}
 				catch (Exception e)
 				{
-					Console.WriteLine(e);
-				}
+					_ErrorHandler(e);
+				}				
 			}
 
-			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs)
+			private void ResponseListener(object sender, ReceiveCompletedEventArgs receiveCompletedEventArgs, Action<Message, TResponse> responseHandler)
 			{
 				MessageQueue mq = (MessageQueue)sender;
 
@@ -236,61 +253,116 @@ namespace LiteQ
 				{
 					Message message = mq.EndReceive(receiveCompletedEventArgs.AsyncResult);
 
-					if (message != null)
-					{
-						TResponse item = (TResponse)message.Body;
-						_Jobs[message.CorrelationId].SetResult(item);
-						Console.WriteLine(item.GetType());
-					}
-				}
-				catch (Exception ex)
-				{
-					Console.WriteLine(ex);
-				}
+					TResponse item = (TResponse) _JsonSerializer.Deserialize(typeof (TResponse), message.BodyStream);
+					responseHandler(message, item);
 
-				mq.BeginReceive(MessageQueue.InfiniteTimeout);
+					mq.BeginReceive(MessageQueue.InfiniteTimeout);
+				}
+				catch (Exception e)
+				{
+					_ErrorHandler(e);
+				}
 			}
 		}
 
 		public class Sender<T> : Sender<T, T>
 		{
-			public Sender(string queueName, Func<T, T> localHandler ) : base(queueName, localHandler)
+			public Sender(string queueName, Func<T, T> localHandler, Action<Message, T> responseHandler, Action<Exception> errorHandler, JsonConverter[] converters = null, bool adminResponse = false ) 
+				: base(queueName, localHandler, responseHandler, errorHandler, converters, adminResponse )
 			{
 			}
 		}
-
 
 		static IPAddress GetLocalIP()
 		{
 			var networkInterface = NetworkInterface.GetAllNetworkInterfaces().FirstOrDefault(ni => ni.Name == "COMM");
 
-			try
+			if (networkInterface != null)
 			{
-				if (networkInterface != null)
+				foreach (UnicastIPAddressInformation IP in networkInterface.GetIPProperties().UnicastAddresses)
 				{
-					foreach (System.Net.NetworkInformation.UnicastIPAddressInformation IP in networkInterface.GetIPProperties().UnicastAddresses)
-					{
-						//Match address family
-						if (IP.Address.AddressFamily != AddressFamily.InterNetwork)
-							continue;
+					//Match address family
+					if (IP.Address.AddressFamily != AddressFamily.InterNetwork)
+						continue;
 
-						//Check for IPv6 conditions since we can easily have multiple IPs
-						if (IP.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && (IP.Address.IsIPv6LinkLocal || IP.AddressPreferredLifetime != uint.MaxValue || IP.AddressValidLifetime != uint.MaxValue))
-							continue;
+					//Check for IPv6 conditions since we can easily have multiple IPs
+					if (IP.Address.AddressFamily == AddressFamily.InterNetworkV6 && (IP.Address.IsIPv6LinkLocal || IP.AddressPreferredLifetime != uint.MaxValue || IP.AddressValidLifetime != uint.MaxValue))
+						continue;
 
-						//We've found the IP
-						return IP.Address;
-					}
+					//We've found the IP
+					return IP.Address;
 				}
 			}
-			catch (Exception e)
-			{
-				
-			}
+			
 			return null;
 		}
 	}
 
+	/// <summary>
+	/// Class that handles sending and receiving a single type
+	/// </summary>
+	/// <typeparam name="T">The Type of the message body</typeparam>
+	public class ShippingStore<T> : ShippingStore<T, T>
+	{
+		public ShippingStore(string uniqueStoreName, Func<T, T> localHandler, Action<Exception> errorHandler, JsonConverter[] converters = null, bool adminResponse = false)
+			: base(uniqueStoreName, localHandler, errorHandler, converters, adminResponse)
+		{	
+		}
+	}
+
+	/// <summary>
+	/// Class that handles sending one type but receives another
+	/// </summary>
+	/// <typeparam name="TRequest">The Type of the request body</typeparam>
+	/// <typeparam name="TResponse">The Type of the response body</typeparam>
+	public class ShippingStore<TRequest, TResponse>
+	{
+		/// <summary>
+		/// Dictionary to keep track of pending tasks tracked by CorrelationId of the MSMQ Message
+		/// </summary>
+		private readonly Dictionary<string, TaskCompletionSource<TResponse>> _Jobs =
+			new Dictionary<string, TaskCompletionSource<TResponse>>();
+
+		private readonly Transit.Sender<TRequest, TResponse> _Sender;
+
+		public ShippingStore(string uniqueStoreName, Func<TRequest, TResponse> localHandler, Action<Exception> errorHandler, JsonConverter[] converters = null, bool adminResponse = false)
+		{
+			_Sender = new Transit.Sender<TRequest, TResponse>(uniqueStoreName, localHandler, Finalize, errorHandler, converters, adminResponse);
+		}
+
+		/// <summary>
+		/// Method to send a message.
+		/// </summary>
+		/// <param name="peerIP">The destination IPAddress</param>
+		/// <param name="body">The body of the message</param>
+		/// <param name="timeout">How long before this message is considered obsolete</param>
+		/// <param name="priority">What is the priority of this message</param>
+		/// <returns>Returns a Task that will complete once the response message has been received</returns>
+		public Task<TResponse> Send(IPAddress peerIP, TRequest body, TimeSpan? timeout = null, MessagePriority priority = MessagePriority.Normal)
+		{
+			TaskCompletionSource<TResponse> taskCompletionSource = new TaskCompletionSource<TResponse>();
+
+			string correlationId = _Sender.Send(peerIP, body, timeout, priority);
+
+			_Jobs.Add(correlationId, taskCompletionSource);
+
+			return taskCompletionSource.Task;
+		}
+
+		/// <summary>
+		/// Sets the Task result once the response is received
+		/// </summary>
+		/// <param name="message">The message coming off the queue</param>
+		/// <param name="item">The body of the message</param>
+		private void Finalize(Message message, TResponse item)
+		{
+			_Jobs[message.CorrelationId].SetResult(item);
+		}
+	}
+
+	/// <summary>
+	/// Class that wraps up several aspects of a particular queue
+	/// </summary>
 	public class SenderInfo
 	{
 		public string OutboundQueuePath { get; set; }
