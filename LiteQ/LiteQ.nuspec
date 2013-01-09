@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package >
+  <metadata>
+    <id>$id$</id>
+    <version>$version$</version>
+    <title>$title$</title>
+    <authors>$author$</authors>
+    <owners>$author$</owners>
+    <licenseUrl>http://opensource.org/licenses/Apache-2.0</licenseUrl>
+    <projectUrl>https://github.com/frontporch/LiteQ</projectUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <description>$description$</description>
+    <releaseNotes>Removed dependency on Reactive Extensions</releaseNotes>
+    <copyright>Copyright 2013</copyright>
+    <tags>MSMQ LiteQ Queue Message Queuing</tags>
+  </metadata>
+</package>

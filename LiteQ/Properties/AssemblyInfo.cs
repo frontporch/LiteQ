@@ -6,11 +6,11 @@ using System.Runtime.InteropServices;
 // set of attributes. Change these attribute values to modify the information
 // associated with an assembly.
 [assembly: AssemblyTitle("LiteQ")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyDescription("Lightweight library for MSMQ")]
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("Front Porch, Inc.")]
 [assembly: AssemblyProduct("LiteQ")]
-[assembly: AssemblyCopyright("Copyright ©  2013")]
+[assembly: AssemblyCopyright("Copyright © 2013 Front Porch")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 
@@ -34,3 +34,4 @@ using System.Runtime.InteropServices;
 // [assembly: AssemblyVersion("1.0.*")]
 [assembly: AssemblyVersion("0.1.0.0")]
 [assembly: AssemblyFileVersion("0.1.0.0")]
+[assembly: AssemblyInformationalVersion("0.1.1-alpha")]
